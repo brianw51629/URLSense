@@ -1,2 +1,3 @@
-API_KEY=your-api-key-here
-MODEL=desired model here
+GROQ_API_KEY=Key
+GROQ_BASE_URL=Url
+GROQ_MODEL=model
