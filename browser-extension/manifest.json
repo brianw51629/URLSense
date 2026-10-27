@@ -1,0 +1,30 @@
+{
+  "manifest_version": 3,
+  "name": "URLSense Link Guard",
+  "version": "0.4.0",
+  "description": "Holds every page you open until the URLSense app on this computer has checked it.",
+  "permissions": [
+    "declarativeNetRequest",
+    "webNavigation",
+    "storage"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "check.html"
+      ],
+      "matches": [
+        "<all_urls>"
+      ]
+    }
+  ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; frame-ancestors 'none'"
+  }
+}

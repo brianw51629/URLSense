@@ -3,8 +3,9 @@ import com.openai.client.OpenAIClient;
 import com.openai.client.okhttp.OpenAIOkHttpClient;
 import com.openai.models.chat.completions.ChatCompletion;
 import com.openai.models.chat.completions.ChatCompletionCreateParams;
+import com.sun.net.httpserver.HttpExchange;
+import com.sun.net.httpserver.HttpServer;
 import okhttp3.*;
-
 import javax.swing.*;
 import java.awt.*;
 import java.io.*;
@@ -14,31 +15,15 @@ import java.time.*;
 import java.time.temporal.ChronoUnit;
 import java.util.*;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.*;
 
-/**
- * URL Checker, tiered pipeline. Cheapest checks run first; the urlscan.io scan is a last resort.
- *
- *   First pass (automatic, never contacts the target site):
- *     Tier 1  Domain age via RDAP
- *     Tier 2  LLM judgment over the URL + signals above
- *
- *   If the verdict is "unsure", the user is asked where the link came from:
- *     - email/text  -> marked unsafe (a visit could confirm their address is live)
- *     - elsewhere   -> Tier 3: redirect-chain check FROM THIS COMPUTER (runs automatically; the source
- *                      dialog warns the user first), then re-judge; if still undecided ->
- *                      ask the user, then Tier 4: a non-public scan on urlscan.io.
- *
- * Needs JDK 17+, Jackson (com.fasterxml.jackson.core:jackson-databind) and OkHttp
- * (com.squareup.okhttp3:okhttp; already pulled in by the OpenAI SDK, but declare it explicitly
- * and keep the version in line with what `mvn dependency:tree` shows).
- *
- * config.properties (src/main/resources):
- *   GROQ_API_KEY, GROQ_BASE_URL, GROQ_MODEL     required
- *   URLSCAN_API_KEY                              needed for Tier 4 (free account at urlscan.io)
- *   URLSCAN_VISIBILITY                           optional: private (default) or unlisted
- */
 public class UrlChecker {
 
     static final String SYSTEM_PROMPT =
@@ -94,7 +79,6 @@ public class UrlChecker {
      * For contacting the UNTRUSTED target. The DNS hook rejects non-public addresses at the moment
      * of connection, and OkHttp connects to exactly the addresses the hook returned, so there is no
      * gap for DNS rebinding. Redirects are followed manually so every hop can be checked.
-     * No cookies, no proxy (a proxy would resolve DNS where this hook can't see it).
      */
     static final OkHttpClient SAFE_CLIENT = new OkHttpClient.Builder()
             .followRedirects(false)
@@ -122,7 +106,7 @@ public class UrlChecker {
         List<String> signals = new ArrayList<>();   // carried forward so a second pass can add to them
     }
 
-    // ------------------------------------------------------------------ config
+    // config
 
     static Properties loadConfig() {
         Properties p = new Properties();
@@ -152,7 +136,7 @@ public class UrlChecker {
         return value.trim();
     }
 
-    // ------------------------------------------------------------------ helpers
+    // helpers
 
     /** Strip control characters and cap length before putting untrusted text anywhere. */
     static String clean(String s, int max) {
@@ -184,7 +168,76 @@ public class UrlChecker {
         }
     }
 
-    // ------------------------------------------------------------------ Tier 1: domain age
+    // privacy: what the LLM sees
+
+    static final Pattern PARAM_NAME = Pattern.compile("[A-Za-z_][A-Za-z0-9_.\\-\\[\\]]{0,30}");
+
+    /**
+     * The URL as sent to the LLM. Query values are removed
+     * parameter names are kept because they are useful signals. The
+     * fragment is dropped. The path is kept as-is.
+     */
+    static String redactForLlm(String url) {
+        try {
+            URI u = new URI(url);
+            StringBuilder out = new StringBuilder()
+                    .append(u.getScheme()).append("://").append(u.getRawAuthority())
+                    .append(u.getRawPath() == null ? "" : u.getRawPath());
+            String q = u.getRawQuery();
+            if (q != null && !q.isEmpty()) {
+                List<String> parts = new ArrayList<>();
+                for (String pair : q.split("&")) {
+                    int eq = pair.indexOf('=');
+                    String name = eq < 0 ? pair : pair.substring(0, eq);
+                    if (!PARAM_NAME.matcher(name).matches()) name = "[removed]";
+                    parts.add(eq < 0 ? name : name + "=[removed]");
+                }
+                out.append('?').append(String.join("&", parts));
+            }
+            return out.toString();
+        } catch (Exception e) {
+            String host = hostOf(url);
+            return host.isEmpty() ? "[unparseable URL removed]" : "https://" + host + "/[rest removed]";
+        }
+    }
+
+    /**
+     * Query values are hidden from the LLM, but a value that is itself a link
+     * matters, so report just the host it points to.
+     */
+    static List<String> querySignals(String url) {
+        List<String> signals = new ArrayList<>();
+        String q;
+        try {
+            q = new URI(url).getRawQuery();
+        } catch (Exception e) {
+            return signals;
+        }
+        if (q == null || q.isEmpty()) return signals;
+        signals.add("Query string: values were removed for privacy before this check; "
+                + "their absence is not a signal.");
+        for (String pair : q.split("&")) {
+            int eq = pair.indexOf('=');
+            if (eq < 0 || signals.size() > 4) continue;
+            String value;
+            try {
+                value = URLDecoder.decode(pair.substring(eq + 1), java.nio.charset.StandardCharsets.UTF_8);
+            } catch (Exception e) {
+                continue;
+            }
+            if (value.matches("(?i)^https?://.*")) {
+                String host = hostOf(value);
+                String name = pair.substring(0, eq);
+                if (!PARAM_NAME.matcher(name).matches()) name = "[removed]";
+                if (!host.isEmpty()) {
+                    signals.add("Query parameter '" + name + "' contains a link to host: " + clean(host, 100));
+                }
+            }
+        }
+        return signals;
+    }
+
+    // Tier 1: domain age
 
     /** Days since registration via RDAP, or null if unknown. Never connects to the target site. */
     static Long domainAgeDays(String host) {
@@ -220,7 +273,7 @@ public class UrlChecker {
         return "not newly registered (age alone is not evidence of safety)";
     }
 
-    // ------------------------------------------------------------------ Tier 3: redirect chain (contacts the target)
+    // Tier 2: redirect chain (Only IP exposed)
 
     static boolean isPublicAddress(InetAddress a) {
         if (a.isAnyLocalAddress() || a.isLoopbackAddress() || a.isLinkLocalAddress()
@@ -244,10 +297,9 @@ public class UrlChecker {
     }
 
     /**
-     * Follows redirects manually (HEAD only), validating every hop.
-     *
+     * Follows redirect headers only, validating every hop.
      * This connects to the target from THIS computer, so the site's owner can see the user's IP
-     * and learn that the address is live. Only call it after the user has agreed, and never for
+     * Only call it after the user has agreed, and never for
      * links that came from an email or text.
      */
     static String safeHeaderCheck(String url) {
@@ -256,7 +308,7 @@ public class UrlChecker {
             String current = url;
             for (int hop = 0; hop <= MAX_HOPS; hop++) {
                 Request req = new Request.Builder()
-                        .url(current)                                  // throws on an invalid URL
+                        .url(current)
                         .head()
                         .header("User-Agent", "UrlChecker")
                         .build();
@@ -276,22 +328,22 @@ public class UrlChecker {
                     }
                     HttpUrl next = req.url().resolve(loc);
                     if (next == null) return clean(chain + "redirect to an invalid URL", 500);
-                    current = next.toString();                         // re-validated on the next loop
+                    current = next.toString();
                 }
             }
             return clean(chain + "too many redirects", 500);
         } catch (Exception e) {
-            // An SSL error or blocked address is itself useful information, so report the type only.
             return clean(chain + "fetch failed: " + e.getClass().getSimpleName(), 500);
         }
     }
 
-    // ------------------------------------------------------------------ first pass + LLM
+    // first pass + LLM (Tier 1)
 
     /** First pass: domain age + LLM. Never contacts the target site. */
     static Result checkUrl(String url) {
         List<String> signals = new ArrayList<>();
         signals.add("Domain age: " + domainAgeNote(hostOf(url)));
+        signals.addAll(querySignals(url));
         return classify(url, signals);
     }
 
@@ -312,7 +364,7 @@ public class UrlChecker {
         ChatCompletionCreateParams params = ChatCompletionCreateParams.builder()
                 .model(model)
                 .addSystemMessage(SYSTEM_PROMPT)
-                .addUserMessage("<url>\n" + url + "\n</url>\n<signals>\n"
+                .addUserMessage("<url>\n" + redactForLlm(url) + "\n</url>\n<signals>\n"
                         + String.join("\n", signals) + "\n</signals>")
                 .build();
 
@@ -347,7 +399,7 @@ public class UrlChecker {
         return r;
     }
 
-    // ------------------------------------------------------------------ Tier 4: urlscan.io scan
+    // Tier 3: urlscan.io scan
 
     record Reply(int status, byte[] body, HttpHeaders headers) { }
 
@@ -454,11 +506,10 @@ public class UrlChecker {
     }
 
     /**
-     * Rule-based scoring over structured fields of urlscan.io's result. Page text is never fed back
-     * to the LLM. The fields used come from urlscan.io's Result API reference, and every read is
+     * Rule-based scoring over structured fields of urlscan.io's result.
+     * The fields used come from urlscan.io's Result API reference, and every read is
      * defensive: a missing field just contributes nothing. A clean scan stays "unsure", because
-     * evasive pages can behave well when they detect a scanner. The point values are judgment
-     * calls; tune them against real results.
+     * evasive pages can behave well when they detect a scanner.
      */
     static Result score(JsonNode r, String uuid) {
         int points = 0;
@@ -475,7 +526,6 @@ public class UrlChecker {
             points += 25; findings.add("urlscan.io rates the page as somewhat suspicious (score " + verdictScore + ")");
         }
 
-        // Not described in the Result API reference, so read defensively; absent means false.
         if (verdicts.path("overall").path("malicious").asBoolean(false)
                 || urlscan.path("malicious").asBoolean(false)) {
             points += 60; findings.add("urlscan.io marked the scan as malicious");
@@ -530,11 +580,11 @@ public class UrlChecker {
         return out;
     }
 
-    // ------------------------------------------------------------------ input
+    // input
 
     static String normalizeUrl(String raw) throws Exception {
         String trimmed = raw.trim();
-        if (trimmed.isEmpty()) throw new Exception("Enter a URL to check.");
+        if (trimmed.isEmpty()) throw new Exception("No URL was received.");
         String withScheme = trimmed.matches("(?i)^[a-z][a-z0-9+.-]*://.*") ? trimmed : "https://" + trimmed;
         try {
             URI uri = new URI(withScheme);
@@ -547,27 +597,190 @@ public class UrlChecker {
         return withScheme;
     }
 
-    // ------------------------------------------------------------------ UI
+    // browser listener
 
-    private final JTextField urlField = new JTextField();
-    private final JButton checkButton = new JButton("Check");
+    static final int DEFAULT_LISTENER_PORT = 47615;
+    static final int MAX_REQUEST_BYTES = 16 * 1024;
+    static final int MAX_IN_FLIGHT = 10;
+    static final AtomicInteger IN_FLIGHT = new AtomicInteger();
+
+    /** A result that means "the check itself couldn't run", sent to the browser as verdict "error". */
+    static Result errorResult(String message) {
+        Result r = new Result();
+        r.verdict = "error";
+        r.reasoning = message == null ? "Unknown error." : message;
+        return r;
+    }
+
+    /**
+     * Local endpoint for the browser extension. Bound to 127.0.0.1 only, and it serves only requests
+     * whose Origin is this project's extension, so ordinary web pages can't drive it.
+     * The reply is sent once the whole pipeline is finished, including any questions the app asks.
+     */
+    static void startBrowserListener(UrlChecker app) throws IOException {
+        Properties config = loadConfig();
+        String extensionId = requireProperty(config, "EXTENSION_ID");
+        String portText = optionalProperty("LISTENER_PORT");
+        int port = portText == null ? DEFAULT_LISTENER_PORT : Integer.parseInt(portText);
+        String allowedOrigin = "chrome-extension://" + extensionId;
+        String expectedHost = "127.0.0.1:" + port;
+
+        HttpServer server = HttpServer.create(
+                new InetSocketAddress(InetAddress.getByName("127.0.0.1"), port), 0);
+        server.createContext("/check", ex -> {
+            try {
+                handleCheck(ex, app, allowedOrigin, expectedHost);
+            } catch (Exception e) {
+                try {
+                    sendJson(ex, 500, Map.of("verdict", "error", "reasoning", "Internal error in URL Checker."));
+                } catch (Exception ignored) { }   // headers were already sent
+            } finally {
+                ex.close();
+            }
+        });
+        ExecutorService pool = Executors.newCachedThreadPool(r -> {
+            Thread t = new Thread(r, "browser-listener");
+            t.setDaemon(true);
+            return t;
+        });
+        server.setExecutor(pool);
+        server.start();
+    }
+
+    static void handleCheck(HttpExchange ex, UrlChecker app, String allowedOrigin, String expectedHost)
+            throws IOException {
+        var in = ex.getRequestHeaders();
+        if (!allowedOrigin.equals(in.getFirst("Origin")) || !expectedHost.equalsIgnoreCase(in.getFirst("Host"))) {
+            ex.sendResponseHeaders(403, -1);
+            return;
+        }
+        var out = ex.getResponseHeaders();
+        out.set("Access-Control-Allow-Origin", allowedOrigin);
+        out.set("Vary", "Origin");
+        if (ex.getRequestMethod().equals("OPTIONS")) {
+            out.set("Access-Control-Allow-Methods", "POST");
+            out.set("Access-Control-Allow-Headers", "Content-Type");
+            ex.sendResponseHeaders(204, -1);
+            return;
+        }
+        if (!ex.getRequestMethod().equals("POST")) {
+            ex.sendResponseHeaders(405, -1);
+            return;
+        }
+
+        byte[] body = ex.getRequestBody().readNBytes(MAX_REQUEST_BYTES + 1);
+        if (body.length > MAX_REQUEST_BYTES) {
+            ex.sendResponseHeaders(413, -1);
+            return;
+        }
+        String url;
+        try {
+            url = MAPPER.readTree(body).path("url").asText("");
+        } catch (IOException e) {
+            ex.sendResponseHeaders(400, -1);
+            return;
+        }
+
+        // Cap the backlog so a flood of requests can't pile up threads and dialogs.
+        if (IN_FLIGHT.incrementAndGet() > MAX_IN_FLIGHT) {
+            IN_FLIGHT.decrementAndGet();
+            sendJson(ex, 429, Map.of("verdict", "error",
+                    "reasoning", "URL Checker is busy with other links. Try again in a moment."));
+            return;
+        }
+        Result r;
+        CompletableFuture<Result> future = app.requestCheck(url);
+        try {
+            r = future.get(5, TimeUnit.MINUTES);
+        } catch (TimeoutException e) {
+            future.cancel(false);   // drop it from the queue if it hasn't started
+            r = errorResult("The check took too long.");
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            future.cancel(false);
+            r = errorResult("The check was interrupted.");
+        } catch (ExecutionException e) {
+            r = errorResult("Something went wrong: " + e.getCause().getMessage());
+        } finally {
+            IN_FLIGHT.decrementAndGet();
+        }
+        sendJson(ex, 200, Map.of(
+                "verdict", r.verdict,
+                "confidence", r.confidence,
+                "reasoning", r.reasoning,
+                "redFlags", r.redFlags));
+    }
+
+    static void sendJson(HttpExchange ex, int status, Object value) throws IOException {
+        byte[] bytes = MAPPER.writeValueAsBytes(value);
+        ex.getResponseHeaders().set("Content-Type", "application/json; charset=utf-8");
+        ex.sendResponseHeaders(status, bytes.length);
+        try (OutputStream os = ex.getResponseBody()) {
+            os.write(bytes);
+        }
+    }
+
+    // UI
+
+    private final JLabel currentUrlLabel = new JLabel(" ");
     private final JLabel verdictLabel = new JLabel(" ");
     private final JLabel confidenceLabel = new JLabel(" ");
     private final JTextArea detailsArea = new JTextArea();
     private String lastUrl = "";   // only touched on the Swing event thread
+    private JFrame frame;
+
+    private boolean busy = false;
+    private CompletableFuture<Result> pending;
+    private final Deque<Map.Entry<String, CompletableFuture<Result>>> browserQueue = new ArrayDeque<>();
+
+    /** Called from a listener thread. Queues the URL; the future completes when its check is finished. */
+    CompletableFuture<Result> requestCheck(String url) {
+        CompletableFuture<Result> f = new CompletableFuture<>();
+        SwingUtilities.invokeLater(() -> {
+            browserQueue.add(Map.entry(url, f));
+            runNextBrowserCheck();
+        });
+        return f;
+    }
+
+    private void runNextBrowserCheck() {
+        while (!browserQueue.isEmpty() && browserQueue.peek().getValue().isDone()) {
+            browserQueue.poll();   // the browser already gave up on this one
+        }
+        if (busy || browserQueue.isEmpty()) return;
+        Map.Entry<String, CompletableFuture<Result>> next = browserQueue.poll();
+        pending = next.getValue();
+        startCheck(next.getKey());
+    }
+
+    /** Every check ends here: answers the waiting browser request (if any) and starts the next one. */
+    private void finish(Result r) {
+        busy = false;
+        if (pending != null) {
+            pending.complete(r);
+            pending = null;
+        }
+        runNextBrowserCheck();
+    }
+
+    /** The app needs an answer for a browser check, so make sure its window is visible. */
+    private void bringToFront() {
+        if (pending == null) return;
+        if (frame.getExtendedState() == Frame.ICONIFIED) frame.setExtendedState(Frame.NORMAL);
+        frame.setAlwaysOnTop(true);    // toFront() alone often just flashes the taskbar button
+        frame.toFront();
+        frame.requestFocus();
+        frame.setAlwaysOnTop(false);
+    }
 
     private void buildAndShow() {
-        JFrame frame = new JFrame("URL Checker");
+        frame = new JFrame("URL Checker");
         frame.setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
 
-        urlField.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 14));
-        urlField.addActionListener(e -> startCheck());
-        checkButton.addActionListener(e -> startCheck());
-
+        currentUrlLabel.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 13));
         JPanel inputRow = new JPanel(new BorderLayout(8, 0));
-        inputRow.add(new JLabel("URL"), BorderLayout.WEST);
-        inputRow.add(urlField, BorderLayout.CENTER);
-        inputRow.add(checkButton, BorderLayout.EAST);
+        inputRow.add(new JLabel("Link"), BorderLayout.WEST);
+        inputRow.add(currentUrlLabel, BorderLayout.CENTER);
 
         verdictLabel.setFont(verdictLabel.getFont().deriveFont(Font.BOLD, 32f));
         detailsArea.setEditable(false);
@@ -594,7 +807,8 @@ public class UrlChecker {
         frame.setMinimumSize(new Dimension(440, 320));
         frame.setLocationRelativeTo(null);
         frame.setVisible(true);
-        urlField.requestFocusInWindow();
+        showMessage("Waiting for links from Chrome. Keep this window open while you browse; "
+                + "it will come to the front if a link needs your input.");
     }
 
     private void showMessage(String message) {
@@ -620,9 +834,10 @@ public class UrlChecker {
      * Email/text: mark unsafe, with no network contact. Elsewhere: run the redirect check automatically.
      */
     private void askSource(Result r) {
+        bringToFront();
         String[] options = {"Email or text message", "Somewhere else"};
         int choice = JOptionPane.showOptionDialog(
-                checkButton,
+                frame,
                 "The AI couldn't decide on this link.\nWhere did you get it?\n\n"
                         + "If you choose \"Somewhere else\", this app will connect to the link from this\n"
                         + "computer to read its redirects, so the site's owner can see your IP address.",
@@ -633,7 +848,7 @@ public class UrlChecker {
                 options,
                 options[0]);
 
-        if (choice == 0) { // email or text
+        if (choice == 0) {
             r.verdict = "unsafe";
             r.confidence = "";
             r.reasoning = "Marked unsafe because the link came from an email or text. "
@@ -641,16 +856,17 @@ public class UrlChecker {
                     + "tell the sender that your address or number is real and active.\n\n"
                     + "Original AI assessment: " + r.reasoning;
             displayResult(r);
-        } else if (choice == 1) { // somewhere else
+            finish(r);
+        } else if (choice == 1) {
             runHeaderCheck(r);
+        } else {
+            finish(r);
         }
-        // A closed dialog: stop here and leave the "Unsure" result showing.
     }
 
     /** Redirect check from this computer, then a re-judgment. If still unsure, offers the urlscan.io scan. */
     private void runHeaderCheck(Result original) {
         final String url = lastUrl;
-        checkButton.setEnabled(false);
         verdictLabel.setForeground(Color.GRAY);
         verdictLabel.setText("Checking redirects\u2026");
         confidenceLabel.setText(" ");
@@ -662,7 +878,6 @@ public class UrlChecker {
                 signals.add("Redirect chain: " + safeHeaderCheck(url));
 
                 Result second = classify(url, signals);
-                // A clean redirect check must never turn "unsure" into "safe".
                 if (second.verdict.equals("safe")) {
                     second.verdict = "unsure";
                     second.confidence = "";
@@ -673,17 +888,19 @@ public class UrlChecker {
             }
 
             @Override protected void done() {
-                checkButton.setEnabled(true);
                 try {
                     Result r = get();
                     displayResult(r);
                     if (r.verdict.equals("unsure")) askScan(r);
+                    else finish(r);
                 } catch (ExecutionException e) {
                     original.reasoning = "Redirect check unavailable: " + e.getCause().getMessage()
                             + "\n\n" + original.reasoning;
                     displayResult(original);
+                    finish(original);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
+                    finish(original);
                 }
             }
         }.execute();
@@ -691,8 +908,9 @@ public class UrlChecker {
 
     /** Still unsure after the redirect check: ask before sending the link to urlscan.io. */
     private void askScan(Result r) {
+        bringToFront();
         int pick = JOptionPane.showConfirmDialog(
-                checkButton,
+                frame,
                 "The redirect check wasn't enough to decide.\n\n"
                         + "Scan this link with urlscan.io? The link is sent to urlscan.io, which visits it\n"
                         + "from its own servers (not your computer) and keeps the scan non-public.\n"
@@ -701,13 +919,12 @@ public class UrlChecker {
                 JOptionPane.YES_NO_OPTION,
                 JOptionPane.QUESTION_MESSAGE);
         if (pick == JOptionPane.YES_OPTION) runScan(r);
-        // No or a closed dialog: leave the "Unsure" result showing.
+        else finish(r);   // No or a closed dialog: leave the "Unsure" result showing.
     }
 
     /** urlscan.io scan. If it fails, the earlier assessment stays on screen with the reason. */
     private void runScan(Result before) {
         final String url = lastUrl;
-        checkButton.setEnabled(false);
         verdictLabel.setForeground(Color.GRAY);
         verdictLabel.setText("Scanning with urlscan.io\u2026");
         confidenceLabel.setText(" ");
@@ -721,31 +938,38 @@ public class UrlChecker {
             }
 
             @Override protected void done() {
-                checkButton.setEnabled(true);
                 try {
-                    displayResult(get());
+                    Result r = get();
+                    displayResult(r);
+                    finish(r);
                 } catch (ExecutionException e) {
                     before.reasoning = "Scan unavailable: " + e.getCause().getMessage()
                             + "\n\n" + before.reasoning;
                     displayResult(before);
+                    finish(before);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
+                    finish(before);
                 }
             }
         }.execute();
     }
 
-    private void startCheck() {
+    private void startCheck(String rawUrl) {
+        if (busy) return;
+        currentUrlLabel.setText(clean(rawUrl, 120));
+        currentUrlLabel.setToolTipText(clean(rawUrl, 2000));
         String url;
         try {
-            url = normalizeUrl(urlField.getText());
+            url = normalizeUrl(rawUrl);
         } catch (Exception e) {
             showMessage(e.getMessage());
+            finish(errorResult(e.getMessage()));
             return;
         }
+        busy = true;
         lastUrl = url;
 
-        checkButton.setEnabled(false);
         verdictLabel.setForeground(Color.GRAY);
         verdictLabel.setText("Checking\u2026");
         confidenceLabel.setText(" ");
@@ -757,15 +981,17 @@ public class UrlChecker {
             }
 
             @Override protected void done() {
-                checkButton.setEnabled(true);
                 try {
                     Result r = get();
                     displayResult(r);
                     if (r.verdict.equals("unsure")) askSource(r);
+                    else finish(r);
                 } catch (ExecutionException e) {
                     showMessage("Something went wrong:\n" + e.getCause().getMessage());
+                    finish(errorResult("Something went wrong: " + e.getCause().getMessage()));
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
+                    finish(errorResult("The check was interrupted."));
                 }
             }
         }.execute();
@@ -776,7 +1002,14 @@ public class UrlChecker {
             try {
                 UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName());
             } catch (Exception ignored) { }
-            new UrlChecker().buildAndShow();
+            UrlChecker app = new UrlChecker();
+            app.buildAndShow();
+            try {
+                startBrowserListener(app);
+            } catch (Exception e) {
+                app.showMessage("The browser extension can't reach this app: " + e.getMessage()
+                        + "\n\nFix the problem above and restart the app; until then no links can be checked.");
+            }
         });
     }
 }

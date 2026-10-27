@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>URLSense: checking link</title>
+  <style>
+    :root { --bg:#f6f6f4; --card:#fff; --text:#1d1d1b; --muted:#66655f; --line:#deddd8;
+            --safe:#1f7a4d; --unsafe:#b3261e; --unsure:#a66a00; }
+    @media (prefers-color-scheme: dark) {
+      :root { --bg:#1b1b1a; --card:#242423; --text:#ecebe6; --muted:#a3a29c; --line:#3a3a38;
+              --safe:#5cc493; --unsafe:#ff8a80; --unsure:#f2b84b; }
+    }
+    * { box-sizing: border-box; }
+    body { margin:0; min-height:100vh; display:grid; place-items:center; padding:16px;
+           background:var(--bg); color:var(--text); font:15px/1.5 system-ui, sans-serif; }
+    main { width:100%; max-width:560px; background:var(--card); border:1px solid var(--line);
+           border-radius:12px; padding:28px; }
+    .label { color:var(--muted); font-size:13px; margin:0 0 4px; }
+    #url { font-family:ui-monospace, monospace; font-size:13px; word-break:break-all; margin:0 0 20px; }
+    h1 { font-size:28px; margin:0 0 2px; }
+    #confidence { color:var(--muted); margin:0 0 12px; }
+    #details { white-space:pre-wrap; margin:0 0 20px; }
+    .safe h1 { color:var(--safe); } .unsafe h1 { color:var(--unsafe); }
+    .unsure h1, .error h1, .blocked h1 { color:var(--unsure); }
+    .actions { display:flex; gap:10px; flex-wrap:wrap; }
+    button { font:inherit; padding:8px 16px; border-radius:8px; border:1px solid var(--line);
+             background:var(--card); color:var(--text); cursor:pointer; }
+    button.primary { background:var(--text); color:var(--card); border-color:var(--text); }
+    button.quiet { border-color:transparent; color:var(--muted); text-decoration:underline; }
+    [hidden] { display:none !important; }
+  </style>
+</head>
+<body>
+  <main id="card">
+    <p class="label">URLSense is checking</p>
+    <p id="url"></p>
+    <h1 id="verdict">Checking…</h1>
+    <p id="confidence"></p>
+    <p id="details">If URLSense needs to ask you something, its window will pop up.</p>
+    <div class="actions">
+      <button id="back" class="primary" hidden>Go back</button>
+      <button id="retry" hidden>Try again</button>
+      <button id="proceed" class="quiet" hidden>Open anyway</button>
+    </div>
+  </main>
+  <script src="config.js"></script>
+  <script src="check.js"></script>
+</body>
+</html>
